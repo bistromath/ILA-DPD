@@ -1,5 +1,5 @@
 classdef ILA_DPD < handle
-    %ILA_DPD. Inderect Learning Architecture DPD.
+    %ILA_DPD. Indirect Learning Architecture DPD.
     %
     %  x(n)   +-----+ u(n) +-----+
     % +-----> | DPD +--+-> | PA  +------+
@@ -94,7 +94,7 @@ classdef ILA_DPD < handle
         
         
         function perform_learning(obj, x, pa)
-            %perform_learning. Perfrom ILA DPD.
+            %perform_learning. Perform ILA DPD.
             %
             % The PA output is the input to the postdistorter used for
             % learning. We want the error to be zero which happens when the
@@ -110,48 +110,103 @@ classdef ILA_DPD < handle
             obj.coeff_history = obj.coeffs;
             obj.result_history  = zeros(3, obj.nIterations+1);
             for iteration = 1:obj.nIterations
-                % Forward through Predistorter
-                u = obj.predistort(x);
-                [y, test_signal] = pa.transmit(u); % Transmit the predistorted pa input
+                fprintf('Iteration: %i\n', iteration);
+                
+                X = setup_basis_matrix(obj, x.data);
+                u = X*obj.coeffs; %predistort the signal using existing coeffs
+                test_signal = Signal(pa.transmit(u), x.current_fs); % Transmit the predistorted pa input
+                
+                y = test_signal.data;
                 obj.result_history(:, iteration) = test_signal.measure_all_powers;
-                % Learn on postdistrter
+                
+                % Learn on postdistorter
                 Y = setup_basis_matrix(obj, y);
+                
                 switch obj.learning_method
                     case 'newton'
-                        post_distorter_out = obj.predistort(y);
-                        error = u - post_distorter_out;
-                        ls_result = ls_estimation(obj, Y, error);
-                        obj.coeffs = obj.coeffs + (obj.learning_rate) * ls_result;
+                        post_distorter_out = Y*obj.coeffs; %postdistort the received signal
+                        error = u - post_distorter_out; %compare to the predistorted signal you just sent
+                        ls_result = ls_estimation(obj, Y, error); %perform LS estimation of DPD coeffs
+                        % "give me an error update such that Y * coeffs
+                        % produces that error"
+                        obj.coeffs = obj.coeffs + (obj.learning_rate) * ls_result; %update coeffs using Newton's method
                     case 'ema'
-                        ls_result = ls_estimation(obj, Y, u);
+                        ls_result = lasso_estimation(obj, Y, u);
+                        %"give me coeffs such that the transmitted signal
+                        %multiplied by those coeffs is closest to the
+                        %predistorted signal"
                         obj.coeffs = (1-obj.learning_rate) * obj.coeffs + (obj.learning_rate) * ls_result;
                 end
+                
+                %update the coeff history
                 obj.coeff_history = [obj.coeff_history obj.coeffs];
             end
-            % Need extra to evaluate final iteration
-            u = obj.predistort(x);
-            [~, test_signal] = pa.transmit(u); % Transmit the predistorted pa input
+            % Need extra to evaluate final iteration with new coeffs
+            % But we've already setup the basis matrix for x as X,
+            % so we can just multiply by the new coeffs.
+            u = X*obj.coeffs;
+            test_signal = Signal(pa.transmit(u), x.current_fs); % Transmit the predistorted pa input
             obj.result_history(:, iteration+1) = test_signal.measure_all_powers;
         end
         
+        function beta = lasso_estimation(obj, X, y)
+            % Trim X and y to get rid of 0s in X.
+            X = X(obj.memory_depth+obj.lag_depth:end-obj.lag_depth, :);
+            y = y(obj.memory_depth+obj.lag_depth:end-obj.lag_depth);
+            
+            % lasso doesn't do complex data, so you need to reformulate as
+            % X = [Re(X), -Imag(X),; Imag(X), Re(X)]
+            % y = [Re(y); Imag(y)]
+            % beta = [Re(beta); Imag(beta)]
+            % ...and then use a group lasso solver instead of this one.
+            % the nice part about doing that, however, is it will force
+            % near-zero coefficients to zero, showing you the actual
+            % nonlinearities in the system and allowing you to avoid
+            % using every coefficient in a sparsely nonlinear system.
+            % [x, history] = group_lasso(A, b, p, lambda, rho, alpha);
+            % 
+            % you know what, though, you're going to have to set up the
+            % basis vector in a different way. right? your basis vector X
+            % is samples with each delay in a different column.
+            
+            %regularization parameter. there is a data-driven way to select
+            %this, but i can't figure it out right now.
+            lambda = 0.001;
+            p = ones(size(X,2)); %partition?
+            rho = 1.0;
+            alpha = 1.0; %typically 1.0-1.8
+            %size(X)
+            %size(y)
+            %ugh = size(X);
+            %X_c = zeros(2, ugh(1), ugh(2));
+            %X_c(1,:,:) = real(X);
+            %X_c(2,:,:) = imag(X);
+            %y = [real(y), imag(y)];
+            [beta, history] = group_lasso(X, y, lambda, p, rho, alpha);
+        end
         
         function beta = ls_estimation(obj, X, y)
             %ls_estimation
             % Solves problems where we want to minimize the error between a
-            % lienar model and some input/output data.
+            % linear model and some input/output data.
             %
             %     min || y - X*beta ||^2
             %
-            % A small regularlizer, lambda, is included to improve the
-            % conditioning of the matrix.
+            % A small regularizer, lambda, is included to improve the
+            % conditioning of the matrix. This is Tikhonov regularization.
             %
+            % y = X*beta+epsilon (where ep is error)
+            % (X'*X)*beta = X'*y 
+            % beta = (X'*X)\(X'*y);
             
             % Trim X and y to get rid of 0s in X.
             X = X(obj.memory_depth+obj.lag_depth:end-obj.lag_depth, :);
             y = y(obj.memory_depth+obj.lag_depth:end-obj.lag_depth);
             
-            lambda = 0.001;
-            beta = (X'*X + lambda*eye(size((X'*X)))) \ (X'*y);
+            [~, Xsize] = size(X);
+            lambda = 1e-12; %was 0.001, too large for good performance
+            regularizer = lambda*eye(Xsize,Xsize);
+            beta = (X'*X + regularizer) \ (X'*y);
         end
         
         
@@ -255,7 +310,6 @@ classdef ILA_DPD < handle
         function out = predistort(obj, x)
             %predistort. Use the coeffs stored in object to predistort an
             %input.
-            
             X = obj.setup_basis_matrix(x);
             out = X * obj.coeffs;
         end
@@ -268,17 +322,17 @@ classdef ILA_DPD < handle
             subplot(1,2,1)
             hold on;
             plot(iterations, abs(obj.coeff_history'));
-            title('History for DPD Coeffs Learning');
-            xlabel('Iteration Number');
+            title('DPD coeff history');
+            xlabel('Iteration');
             ylabel('abs(coeffs)');
             grid on;
             subplot(1,2,2)
             
             plot(iterations, (obj.result_history'));
             grid on;
-            title('Performance vs Iteration');
+            title('ACPR vs iteration');
             ylabel('dBm');
-            xlabel('Iteration Number');
+            xlabel('Iteration');
             legend('L1', 'Main Channel', 'U1', 'Location', 'best')
         end
     end

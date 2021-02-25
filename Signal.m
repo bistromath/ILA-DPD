@@ -85,7 +85,7 @@ classdef Signal < handle
         end
         
         function append(obj, new_data)
-            obj.data = [obj.data; new_data];
+            obj.data = [obj.data; new_data]; %this implies signals are single-column vectors
         end
         
         function calculate_current_rms_dbm(obj)
@@ -96,26 +96,31 @@ classdef Signal < handle
             obj.scale_factor = sqrt(50 * length(obj.data) * 10 ^ ((desired_dbm_power-30)/10)) / norm(obj.data);
         end
         
-        function calculate_current_papr(obj)
-            obj.papr = 20*log10(max(abs(obj.data))*sqrt(length(obj.data))/norm(obj.data));
+        function papr = calculate_current_papr(obj)
+            papr = 20*log10( max(abs(obj.data)) / rms(obj.data) );
+            obj.papr = papr;
         end
         
-        function plot_psd(obj, figure_handle)
-            Nfft    = 1024;
-            Window  = kaiser(1000, 9);
+        %modified to plot relative PSD
+        function p = plot_psd(obj, color, figure_handle)
+            Nfft    = 4096;
+            Window  = kaiser(4000, 9);
             Signal_PSD = 10*log10(fftshift(pwelch(obj.data, Window)));
-            if nargin == 2
-                plot(figure_handle, (-1:2/Nfft:1-2/Nfft)*((obj.current_fs)/(2e6)), Signal_PSD, ...
-                    'LineWidth', 0.5);
+            if nargin == 3
+                figure(figure_handle);
             else
                 figure(99);
                 grid on;
                 hold on;
                 title('PSD');
-                plot((-1:2/Nfft:1-2/Nfft)*((obj.current_fs)/(2e6)), Signal_PSD, ...
-                    'LineWidth', 0.5);
-                xlabel('Frequency (MHz)');
+                xlabel('Frequency (kHz)');
                 ylabel('PSD (db/Hz)');
+            end
+            norm_psd = Signal_PSD - max(Signal_PSD);
+            freqs = linspace(-obj.current_fs/2, obj.current_fs/2, Nfft) / 1e3;
+            p = plot(freqs, norm_psd, 'LineWidth', 0.5);
+            if nargin > 1
+                set(p, 'Color', color);
             end
         end
         
@@ -148,6 +153,9 @@ classdef Signal < handle
             elseif (obj.obw >= 3e6) && (obj.obw <= 5e6) % 5 MHz Signal
                 ibw = 4500000;
                 offset = 5e6;
+            elseif (obj.obw >= 5e3) && (obj.obw <= 20e3) % 12kHz channel
+                ibw = 12e3;
+                offset = 12e3;
             else
                 warning('Unknown original fs in Signal.m measure_power method')
                 powbp = -99;
@@ -165,20 +173,37 @@ classdef Signal < handle
                     lower = -0.5*ibw + offset;
                     upper = 0.5*ibw + offset;
                 otherwise
-                    error('Unkown measure type in Signal.m, measure_power method');
+                    error('Unknown measure type in Signal.m, measure_power method');
             end
             F = [lower upper];
             
             try
                 powbp = bandpower(obj.data, obj.current_fs, F);
-            catch
-                warning('Issue when measuring bandpower in Signal.m');
+            catch err
+                warning('Issue when measuring bandpower in Signal.m: %s', err.message);
+                %obj.current_fs
+                %F
                 powbp = -99;
             end
         end
         
-        function compute_occupied_bandwidth(obj)
-            obj.obw = obw(obj.data, obj.current_fs);
+        function obw = compute_occupied_bandwidth(obj, threshold)
+            if nargin == 1
+                threshold = 0.99;
+            end
+            %get Welch power spectrum
+            [p, f] = pwelch(obj.data, 5000, 3000, 5000, 'centered', 'power');
+            total_power = sum(p);
+            midbin = length(p)/2; %should really be finding the peaks i guess
+            sig_power = 0;
+            bw_bins = 0;
+            
+            while sig_power < total_power*threshold
+                sig_power = sum(p(midbin-bw_bins:midbin+bw_bins));
+                bw_bins = bw_bins + 1;
+            end
+            obw = bw_bins*2*obj.current_fs / length(p);
+            obj.obw = obw;
         end
     end
 end
